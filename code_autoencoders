@@ -1,0 +1,626 @@
+import numpy as np
+from torch.autograd import Variable
+from torchvision import datasets
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+import torch.utils.data as data_utils
+import torch
+import matplotlib.pyplot as plt
+%matplotlib inline
+import os
+from time import time
+import pandas as pd
+from tqdm.notebook import tqdm
+from skimage.transform import resize
+from sklearn.model_selection import train_test_split
+from tqdm.notebook import tqdm
+import skimage.io
+
+#подготовка данных, загрузка датасета
+
+def fetch_dataset(attrs_name = "lfw_attributes.txt",
+                      images_name = "lfw-deepfunneled",
+                      dx=80,dy=80,
+                      dimx=64,dimy=64
+    ):
+
+    #download if not exists
+    if not os.path.exists(images_name):
+        print("images not found, donwloading...")
+        os.system("wget http://vis-www.cs.umass.edu/lfw/lfw-deepfunneled.tgz -O tmp.tgz")
+        print("extracting...")
+        os.system("tar xvzf tmp.tgz && rm tmp.tgz")
+        print("done")
+        assert os.path.exists(images_name)
+
+    if not os.path.exists(attrs_name):
+        print("attributes not found, downloading...")
+        os.system("wget http://www.cs.columbia.edu/CAVE/databases/pubfig/download/%s" % attrs_name)
+        print("done")
+
+    #read attrs
+    df_attrs = pd.read_csv("lfw_attributes.txt",sep='\t',skiprows=1,) 
+    df_attrs = pd.DataFrame(df_attrs.iloc[:,:-1].values, columns = df_attrs.columns[1:])
+
+
+    #read photos
+    photo_ids = []
+    for dirpath, dirnames, filenames in os.walk(images_name):
+        for fname in filenames:
+            if fname.endswith(".jpg"):
+                fpath = os.path.join(dirpath,fname)
+                photo_id = fname[:-4].replace('_',' ').split()
+                person_id = ' '.join(photo_id[:-1])
+                photo_number = int(photo_id[-1])
+                photo_ids.append({'person':person_id,'imagenum':photo_number,'photo_path':fpath})
+
+    photo_ids = pd.DataFrame(photo_ids)
+    # print(photo_ids)
+    #mass-merge
+    #(photos now have same order as attributes)
+    df = pd.merge(df_attrs,photo_ids,on=('person','imagenum'))
+
+    assert len(df)==len(df_attrs),"lost some data when merging dataframes"
+
+    # print(df.shape)
+    #image preprocessing
+    all_photos =df['photo_path'].apply(skimage.io.imread)\
+                                .apply(lambda img:img[dy:-dy,dx:-dx])\
+                                .apply(lambda img: resize(img,[dimx,dimy]))
+
+    all_photos = np.stack(all_photos.values)#.astype('uint8')
+    all_attrs = df.drop(["photo_path","person","imagenum"],axis=1)
+    
+    return all_photos, all_attrs
+    
+data, attrs = fetch_dataset()
+
+data_to_array = np.array(data, np.float32)
+
+#функция для отрисовки numpy-картинок
+
+def pictures_from_array(data):
+  plt.figure(figsize=(18, 6))
+  for i in range(6):
+    plt.subplot(1, 6, i+1)
+    
+    plt.imshow(data[i])
+    plt.axis('off')
+
+#посмотрим на картинки из датасета
+pictures_from_array(data)
+
+train_photos, val_photos, train_attrs, val_attrs = train_test_split(data_to_array, attrs,
+                                                                    train_size=0.9, shuffle=False)
+X_train =  torch.permute(torch.tensor(train_photos, dtype=torch.float32), (0, 3, 1, 2)) 
+X_val =  torch.permute(torch.tensor(val_photos, dtype=torch.float32), (0, 3, 1, 2))
+
+
+train_loader = torch.utils.data.DataLoader(X_train, batch_size=64)
+val_loader = torch.utils.data.DataLoader(X_val , batch_size=64)
+
+#проверим, все ли корректно
+
+next(iter(train_loader)).shape
+
+dim_code = 64
+
+#реализация автоэнкодера
+class Autoencoder(nn.Module):
+    def __init__(self):
+
+        super().__init__()
+
+        self.flatten = nn.Flatten()
+
+        self.encoder =nn.Sequential(
+            nn.Conv2d(3, 32, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(),
+            #pool 64 -> 32
+            nn.Conv2d(32,32, kernel_size=2, stride=2),
+
+            nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1),
+            
+            nn.ReLU(),
+            
+            #pool 32-> 16
+            nn.Conv2d(64,64, kernel_size=2, stride=2))
+        
+            #nn.Flatten(),
+        self.linear_encoder = nn.Sequential(
+            nn.Linear(in_features=64*16*16, out_features=32*8*8),
+            nn.ReLU(),
+            nn.Linear(in_features=32*8*8, out_features=16*4*4),
+            nn.ReLU(),
+            nn.Linear(in_features=16*4*4, out_features=dim_code)
+        )
+
+        self.linear_decoder = nn.Sequential(
+            nn.Linear(in_features=dim_code, out_features=16*4*4),
+            nn.ReLU(),
+            nn.Linear(in_features=16*4*4, out_features=32*8*8),
+            nn.ReLU(),
+            nn.Linear(in_features=32*8*8, out_features=64*16*16),
+            
+        )
+
+        self.unflatten = nn.Unflatten(1, (64, 16, 16))
+
+        self.decoder = nn.Sequential(
+            
+            nn.ConvTranspose2d(64, 64, kernel_size=2, stride=2),
+            
+            nn.Conv2d(64, 32, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ConvTranspose2d(32, 32, kernel_size=2, stride=2),
+            nn.ReLU(),
+            
+            nn.Conv2d(32, 3, kernel_size=3, stride=1, padding=1)
+
+        )
+
+    
+        
+    def forward(self, x):
+        
+        x = self.encoder(x)
+        x = self.flatten(x).float()
+        
+        latent_code = self.linear_encoder(x)
+        
+        
+        
+        x = self.linear_decoder(latent_code)
+        
+        x = x.view(-1, 64, 16, 16)
+       
+        
+        reconstruction = self.decoder(x)
+        
+        
+        
+        return reconstruction, latent_code
+        
+device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
+criterion = F.mse_loss
+
+autoencoder = Autoencoder().to(device)
+
+optimizer = torch.optim.Adam(autoencoder.parameters())
+
+#функция для отрисовки графиков во время тренировки
+ef plotting(train_loss, val_loss):
+
+  sns.set(style="whitegrid", font_scale=1.4)
+
+
+
+  plt.figure(figsize=(12, 8))
+  plt.plot(val_loss, label="val_loss")
+  plt.plot(train_loss, label="train_loss")
+
+  plt.legend()
+  plt.xlabel("Epochs")
+  plt.ylabel("Score")
+  plt.show()
+  
+  
+#обучение
+
+n_epochs = 26
+train_losses = []
+val_losses = []
+
+
+for epoch in tqdm(range(n_epochs)):
+    autoencoder.train()
+    train_losses_per_epoch = []
+    tic = time()
+    print('* Epoch %d/%d' % (epoch+1, n_epochs))
+
+       
+    for batch in train_loader:
+        optimizer.zero_grad()
+        reconstruction, latent_code = autoencoder(batch.to(device))
+
+        loss = criterion(reconstruction, batch.to(device).float())
+        loss.backward()
+        optimizer.step()
+        train_losses_per_epoch.append(loss.item())
+        
+
+    train_losses.append(np.mean(train_losses_per_epoch))
+    toc = time()
+    print('loss: %f' % np.mean(train_losses_per_epoch))
+    
+
+    autoencoder.eval()
+    val_losses_per_epoch = []
+    with torch.no_grad():
+        for batch in val_loader:
+          reconstruction, latent_code = autoencoder(batch.to(device))
+
+          loss = criterion(reconstruction, batch.to(device).float())
+          val_losses_per_epoch.append(loss.item())
+    
+    
+    clear_output(wait=True)
+    for i in range(5):
+
+                result = reconstruction[i].cpu().detach().numpy()
+                ground_truth = batch[i].numpy()
+                plt.figure(figsize=(8, 20))
+                
+                plt.subplot(5, 2, 2*i+1)
+                gt=np.rollaxis(ground_truth, 0,3)
+                plt.imshow(gt)
+                plt.axis('off')
+                plt.subplot(5, 2, 2*i+2)
+                res = np.rollaxis(result, 0,3)
+                plt.imshow(res)
+                plt.axis('off')
+    
+
+
+    
+    val_losses.append(np.mean(val_losses_per_epoch))
+    
+    history = {
+            'val_loss': np.mean(val_losses_per_epoch),
+            'train_loss': np.mean(train_losses_per_epoch)
+        }
+    plotting(train_losses, val_losses)
+    
+#сравним оригинальные картинки и выходы сети
+autoencoder.eval()
+
+
+latents_vectors=torch.Tensor()
+with torch.no_grad():
+      for batch in val_loader:
+        reconstruction, latent_code = autoencoder(batch.to(device))
+
+        latents_vectors = torch.cat((latents_vectors, latent_code), 0)
+        result = reconstruction.cpu().detach().numpy()
+        ground_truth = batch.numpy()
+        
+        break
+        
+plt.figure(figsize=(8, 20))
+for i, (gt, res) in enumerate(zip(ground_truth[5:10], result[5:10])):
+  plt.subplot(5, 2, 2*i+1)
+  gt=np.rollaxis(gt, 0,3)
+  plt.axis('off')
+  plt.title('Ground Truth')
+  plt.imshow(gt)
+  plt.subplot(5, 2, 2*i+2)
+  res = np.rollaxis(res, 0,3)
+  plt.axis('off')
+  plt.title('Reconstruction')
+  plt.imshow(res)
+  
+# sampling - самостоятельное создание сетью картинок на основе отнормированного случайного латентного вектора
+
+mu = torch.mean(latents_vectors, 0)
+std = torch.std(latents_vectors, 0)
+
+# сгенерируем 25 рандомных векторов размера latent_space
+z = np.array([np.random.normal(0, 1, dim_code) for i in range(25)])
+z = torch.Tensor(z)
+z_otnorm = torch.multiply(z, std) + mu
+
+def get_picture_from_latent(vector):
+  decode_linear = autoencoder.linear_decoder(vector)
+  decode_linear = decode_linear.view(-1, 64, 16, 16)
+  output = autoencoder.decoder(decode_linear)
+  return output
+  
+output = get_picture_from_latent(z_otnorm)
+#параметр start - чтобы на разные картинки посмотреть
+def pictures_generated(outputs, start):
+  plt.figure(figsize=(18, 18))
+  k = 0
+  for i in range(start, start + 5):
+      plt.subplot(1, 5, k+1)
+      generated = outputs[i].cpu().detach().numpy()
+      #print(generated.shape)
+      generated = np.rollaxis(generated, 0,3)
+      plt.axis('off')
+      k+=1
+      plt.imshow(generated)
+
+
+  
+pictures_generated(output, 10)
+
+# пририсую улыбку
+smiling_people = attrs[(attrs['Smiling'] > 2.5)]['Smiling']
+index_smiles = smiling_people.index.tolist()
+#чтобы одинаковой длины векторы были
+index_smile = index_smiles[0:34]
+sad_people = attrs[(attrs['Frowning'] > 2.5)]['Frowning']
+index_sad = sad_people.index.to_list()
+smile_pictures = data[index_smile]
+sad_pictures = data[index_sad]
+pictures_from_array(smile_pictures)
+pictures_from_array(sad_pictures)
+smile_pictures_tensor = torch.permute(torch.tensor(smile_pictures, dtype=torch.float32), (0, 3, 1, 2)) 
+sad_pictures_tensor = torch.permute(torch.tensor(sad_pictures, dtype=torch.float32), (0, 3, 1, 2)) 
+def latent_vectors(tensor):
+    reconstructed, latent_vector = autoencoder(tensor.to(device))
+    return latent_vector,  reconstructed
+
+smile_vector, sm_p = latent_vectors(smile_pictures_tensor)
+sad_vector, sad_pic = latent_vectors(sad_pictures_tensor)
+smile_vector_m = torch.mean(smile_vector, 0)
+sad_vector_m = torch.mean(sad_vector, 0)
+difference = smile_vector_m-sad_vector_m
+must_smile = sad_vector + difference
+smiled = get_picture_from_latent(must_smile)
+not_smiled = get_picture_from_latent(sad_vector )
+pictures_generated(sad_pic,20)
+pictures_generated(smiled, 20)
+
+
+#variational autoencoder на датасете mnist
+
+batch_size = 32
+# MNIST Dataset
+train_dataset = datasets.MNIST(root='./mnist_data/', train=True, transform=transforms.ToTensor(), download=True)
+test_dataset = datasets.MNIST(root='./mnist_data/', train=False, transform=transforms.ToTensor(), download=False)
+
+# Data Loader (Input Pipeline)
+train_loader = torch.utils.data.DataLoader(dataset=train_dataset, batch_size=batch_size, shuffle=True)
+test_loader = torch.utils.data.DataLoader(dataset=test_dataset, batch_size=batch_size, shuffle=False)
+
+dim_code_2 = 16
+from copy import deepcopy
+
+class VAE(nn.Module):
+    def __init__(self):
+
+        super().__init__()
+
+        self.flatten = nn.Flatten()
+
+      
+        self.linear_encoder = nn.Sequential(
+            nn.Linear(in_features=784, out_features=392),
+            nn.ReLU(),
+            nn.Linear(in_features=392, out_features=196),
+            nn.ReLU(),
+            nn.Linear(in_features=196, out_features=98),
+            nn.ReLU(),
+            nn.Linear(in_features=98, out_features=dim_code_2*2)
+            
+            
+        )
+
+        self.linear_decoder = nn.Sequential(
+            nn.Linear(in_features=dim_code_2, out_features=98),
+            nn.ReLU(),
+            nn.Linear(in_features=98, out_features=196),
+            nn.ReLU(),
+            nn.Linear(in_features=196, out_features=392),
+            nn.ReLU(),
+            nn.Linear(in_features=392, out_features=784)
+            
+        )
+
+        
+
+    def encode(self, x):
+        '''<реализуйте forward проход энкодера
+        в качестве ваозвращаемых переменных -- mu и logsigma>'''
+        
+        x = self.flatten(x).float()
+        
+        latent_code = self.linear_encoder(x)
+        
+        latent_code = latent_code.view(-1, 2, dim_code_2)
+        
+        mu = latent_code[:, 0, :] 
+        logsigma = latent_code[:, 1, :] 
+
+        
+        return mu, logsigma
+
+    def gaussian_sampler(self, mu, logsigma):
+        if self.training:
+            std = torch.exp(0.5 * logsigma)
+            eps = torch.randn_like(std)
+            sample = mu + (eps * std)
+            #print(sample.shape, 'sample ')
+            return sample
+        else:
+            # на инференсе возвращаем не случайный вектор из нормального распределения, а центральный -- mu. 
+            # на инференсе выход автоэнкодера должен быть детерминирован.
+            return mu
+
+    def decode(self, z):
+        #z - latent vector
+        reconstr_lin = self.linear_decoder(z)
+        
+        reconstruction = torch.sigmoid(reconstr_lin)
+        
+        return reconstruction
+
+        
+
+    def forward(self, x):
+        '''<используя encode и decode, реализуйте forward проход автоэнкодера
+        в качестве ваозвращаемых переменных -- mu, logsigma и reconstruction>'''
+
+        mu, logsigma = self.encode(x)
+
+        sample = self.gaussian_sampler(mu, logsigma)
+
+        reconstruction  = self.decode(sample)
+        
+
+        return mu, logsigma, reconstruction     
+        
+def KL_divergence(mu, logsigma):
+    """
+    часть функции потерь, которая отвечает за "близость" латентных представлений разных людей
+    """
+    loss = -0.5 * torch.sum(1 + logsigma - mu.pow(2) - logsigma.exp())
+    #print(loss.shape, ' Kl divirgence')
+    return loss
+
+def log_likelihood(x, reconstruction):
+    """
+    часть функции потерь, которая отвечает за качество реконструкции (как mse в обычном autoencoder)
+    """
+    loss = nn.BCELoss(reduction='sum')
+    l = loss(reconstruction, x)
+    #print(l.shape, ' log_likehood')
+    return l
+
+def loss_vae(x, mu, logsigma, reconstruction):
+    return KL_divergence(mu, logsigma) + log_likelihood(x, reconstruction)
+    
+#fit model
+criterion = loss_vae
+
+autoencoder_vae = VAE()
+
+optimizer = torch.optim.Adam(autoencoder_vae.parameters())
+device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
+
+n_epochs = 40
+train_losses = []
+val_losses = []
+
+
+for epoch in tqdm(range(n_epochs)):
+    autoencoder_vae.train()
+    train_losses_per_epoch = []
+    tic = time()
+    print('* Epoch %d/%d' % (epoch+1, n_epochs))
+
+       
+    for batch, label in train_loader:
+        optimizer.zero_grad()
+        mu, logsigma, reconstruction = autoencoder_vae(batch.to(device))
+        #mu, logsigma = latent_code
+        reconstruction = reconstruction.view(-1, 1, 28, 28)
+        loss = criterion(batch.to(device).float(), mu, logsigma, reconstruction)
+        loss.backward()
+        optimizer.step()
+        train_losses_per_epoch.append(loss.item())
+        
+
+    train_losses.append(np.mean(train_losses_per_epoch))
+    toc = time()
+    print('loss: %f' % np.mean(train_losses_per_epoch))
+    
+
+    autoencoder_vae.eval()
+    val_losses_per_epoch = []
+    with torch.no_grad():
+        for batch, label in test_loader:
+          mu, logsigma, reconstruction = autoencoder_vae(batch.to(device))
+          reconstruction = reconstruction.view(-1, 1, 28, 28)
+          loss = criterion(batch.to(device).float(), mu, logsigma, reconstruction)
+          val_losses_per_epoch.append(loss.item())
+    
+    
+    clear_output(wait=True)
+    
+
+    
+    val_losses.append(np.mean(val_losses_per_epoch))
+    
+    history_vae = {
+            'val_loss': val_losses,
+            'train_loss': train_losses
+        }
+    plotting(train_losses, val_losses)
+    
+#look at results
+autoencoder_vae.eval()
+lat_vecs = torch.Tensor()
+labels = torch.Tensor()
+with torch.no_grad():
+
+      vec_counter = 0
+      for batch, label in test_loader:
+
+        mu, logsigma, reconstruction = autoencoder_vae(batch.to(device))
+        if batch.shape[0] == batch_size:
+          for i in range(batch_size):
+            vec_counter +=1
+            my_latent_vector = autoencoder_vae.linear_encoder(batch[i].to(device).flatten())
+            lat_vecs = torch.cat((lat_vecs, my_latent_vector), 0)
+          labels = torch.cat((labels, label),0)
+        
+        reconstruction = reconstruction.view(-1, 1, 28, 28)
+        result = reconstruction.cpu().detach().numpy()
+        ground_truth = batch.numpy()
+        
+plt.figure(figsize=(10, 5))    
+for i in range(5):
+     
+   plt.subplot(2, 5, i+1)
+   gt=np.rollaxis(ground_truth[i], 0,3)
+   plt.imshow(gt.squeeze())
+   plt.axis('off')
+   plt.subplot(2, 5, i+6)
+   res = np.rollaxis(result[i], 0,3)
+   plt.imshow(res.squeeze())
+   plt.axis('off')
+   
+def get_picture_from_latent_vae(vector):
+  output = autoencoder_vae.decode(vector)
+  output = output.view(-1, 1, 28, 28)
+  return output
+  
+z = np.array([np.random.normal(0, 1, dim_code_2) for i in range(32)])
+
+z = torch.FloatTensor(z).to(device)
+
+z_otnorm = torch.multiply(z, logsigma) + mu
+output_z = get_picture_from_latent_vae(z)
+output_z_otn = get_picture_from_latent_vae(z_otnorm)
+def pictures_generated_vae(outputs, start):
+  plt.figure(figsize=(14, 14))
+  k = 0
+  for i in range(start, start + 5):
+      plt.subplot(1, 5, k+1)
+      generated = outputs[i].cpu().detach().numpy()
+      #generated = generated.view(-1, 1, 28, 28)
+      #print(generated.shape)
+      generated = np.rollaxis(generated, 0, 3)
+      generated = generated.squeeze()
+      plt.axis('off')
+      k+=1
+      plt.imshow(generated)
+
+  plt.show()
+  
+  pictures_generated_vae(output_z, 5)
+  #неотнормированные картинки получаются лучше
+pictures_generated_vae(output_z_otn, 5)
+
+from sklearn.manifold import TSNE
+
+X_embedded = TSNE(n_components=2 ).fit_transform(lat)
+
+X_embedded.shape
+#colors = np.random.rand(len(label))
+X_embedded[:, 1].shape
+
+colors = []
+possible = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf']
+for i in range(9984):
+  s = int(labels[i].item())
+
+  colors.append(possible[s])
+  
+plt.figure(figsize=(8, 8))
+plt.scatter(X_embedded[:, 1],X_embedded[:, 0], labels, c=colors)
+
+
